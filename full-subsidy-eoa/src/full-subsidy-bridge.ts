@@ -38,6 +38,13 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base, arbitrum } from "viem/chains";
+import type {
+  ExecuteGaslessRequest,
+  SignedAuthorization,
+  ExecuteGaslessResponse,
+  QuoteResponse,
+  StatusResponse,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -64,147 +71,36 @@ const BRIDGE_AMOUNT = parseEther("0.001"); // 0.001 ETH for testing
 // It has a `delegatecallMulticall` function that lets the solver execute
 // deposit logic in the context of the user's EOA.
 //
-// These are the active v2 addresses — same across all major EVM chains.
-// In production, fetch these from the Relay API or your own config.
+// Set via RELAY_ERC20_ROUTER_ADDRESS env variable. Same across all major
+// EVM chains (Ethereum, Arbitrum, Base, Optimism).
 // ---------------------------------------------------------------------------
 
-const RELAY_ERC20_ROUTER: Record<number, Address> = {
-  [1]: "0xf5042e6ffac5a625d4e7848e0b01373d8eb9e222", // Ethereum
-  [10]: "0xf5042e6ffac5a625d4e7848e0b01373d8eb9e222", // Optimism
-  [8453]: "0xf5042e6ffac5a625d4e7848e0b01373d8eb9e222", // Base
-  [42161]: "0xf5042e6ffac5a625d4e7848e0b01373d8eb9e222", // Arbitrum
-};
+const RELAY_ERC20_ROUTER_ADDRESS = (process.env.RELAY_ERC20_ROUTER_ADDRESS ||
+  "") as Address;
 
 // EIP-7702 delegation prefix: code stored at the EOA starts with 0xef0100
 // followed by the 20-byte delegate address.
 const EIP7702_DELEGATION_PREFIX = "0xef0100";
 
 // ---------------------------------------------------------------------------
-// Types (matching the solver's /execute endpoint exactly)
-// ---------------------------------------------------------------------------
-
-/** POST /execute request body */
-interface ExecuteGaslessRequest {
-  executionKind: "rawCalls";
-  data: {
-    chainId: number;
-    to: string;
-    data: string;
-    value: string;
-    authorizationList: SignedAuthorization[];
-  };
-  executionOptions: {
-    referrer: string;
-    subsidizeFees: boolean;
-    destinationChainExecutionData?: {
-      calls: Array<{ to: string; data: string; value: string }>;
-      authorizationList?: SignedAuthorization[];
-    };
-  };
-  /** Include when this is a cross-chain request (from a prior /quote call) */
-  requestId?: string;
-}
-
-interface SignedAuthorization {
-  chainId: number;
-  address: string;
-  nonce: number;
-  yParity: number;
-  r: string;
-  s: string;
-}
-
-/** POST /execute response */
-interface ExecuteGaslessResponse {
-  message: string;
-  requestId: string;
-}
-
-/** Fee currency object from /quote response */
-interface CurrencyObject {
-  currency: {
-    chainId: number;
-    address: string;
-    symbol: string;
-    name: string;
-    decimals: number;
-  };
-  amount: string;
-  amountFormatted: string;
-  amountUsd: string;
-}
-
-/** POST /quote response (subset of fields we use) */
-interface QuoteResponse {
-  requestId?: string;
-  steps: Array<{
-    id: string;
-    action: string;
-    description: string;
-    kind: "transaction" | "signature";
-    items: Array<{
-      status: string;
-      data: {
-        from: Address;
-        to: Address;
-        data: Hex;
-        value: string;
-        chainId: number;
-      };
-    }>;
-  }>;
-  fees: {
-    gas: CurrencyObject;
-    relayer: CurrencyObject;
-    relayerGas: CurrencyObject;
-    relayerService: CurrencyObject;
-    app: CurrencyObject;
-    subsidized: CurrencyObject;
-  };
-  details: {
-    operation: string;
-    timeEstimate: number;
-    sender: string;
-    recipient: string;
-    currencyIn: CurrencyObject;
-    currencyOut: CurrencyObject;
-  };
-}
-
-/** GET /intents/status/v3 response */
-interface StatusResponse {
-  status:
-    | "waiting"
-    | "pending"
-    | "submitted"
-    | "success"
-    | "failure"
-    | "refund";
-  inTxHashes?: string[];
-  txHashes?: string[];
-}
-
-// ---------------------------------------------------------------------------
 // Step 0: Check / setup EIP-7702 delegation on the user's EOA
 // ---------------------------------------------------------------------------
 
 async function checkAndSetupDelegation(
-  userAddress: Address,
-  chainId: number
+  userAddress: Address
 ): Promise<{ isDelegated: boolean; delegateAddress: Address }> {
   console.log("\n━━━ Step 0: Check EIP-7702 delegation ━━━\n");
 
-  const delegateAddress = RELAY_ERC20_ROUTER[chainId];
-  if (!delegateAddress) {
+  if (!RELAY_ERC20_ROUTER_ADDRESS) {
     throw new Error(
-      `No Relay erc20Router address configured for chain ${chainId}. ` +
-        `Add it to RELAY_ERC20_ROUTER.`
+      `RELAY_ERC20_ROUTER_ADDRESS is not set. ` +
+        `Add it to your .env file (e.g. 0xf5042e6ffac5a625d4e7848e0b01373d8eb9e222).`
     );
   }
 
   console.log(`  EOA:              ${userAddress}`);
-  console.log(`  Chain:            ${chainId}`);
-  console.log(`  Relay erc20Router: ${delegateAddress}\n`);
+  console.log(`  Chain:            ${ORIGIN_CHAIN_ID}`);
+  console.log(`  Relay erc20Router: ${RELAY_ERC20_ROUTER_ADDRESS}\n`);
 
   // ┌───────────────────────────────────────────────────────────────┐
   // │  EIP-7702 DELEGATION CHECK                                   │
@@ -226,7 +122,7 @@ async function checkAndSetupDelegation(
     console.log("  [DRY RUN] Skipping on-chain delegation check.\n");
     console.log("  In production, call getCode(eoaAddress) to check if the");
     console.log("  EOA is already delegated to the Relay erc20Router.\n");
-    return { isDelegated: false, delegateAddress };
+    return { isDelegated: false, delegateAddress: RELAY_ERC20_ROUTER_ADDRESS };
   }
 
   const publicClient = createPublicClient({
@@ -241,7 +137,7 @@ async function checkAndSetupDelegation(
     // We'll need them to sign a 7702 authorization in Step 2.
     console.log("  Status: NOT delegated (plain EOA)");
     console.log("  → User will need to sign a 7702 authorization.\n");
-    return { isDelegated: false, delegateAddress };
+    return { isDelegated: false, delegateAddress: RELAY_ERC20_ROUTER_ADDRESS };
   }
 
   if (code.toLowerCase().startsWith(EIP7702_DELEGATION_PREFIX)) {
@@ -249,17 +145,26 @@ async function checkAndSetupDelegation(
     const currentDelegate = ("0x" +
       code.slice(EIP7702_DELEGATION_PREFIX.length)) as Address;
 
-    if (currentDelegate.toLowerCase() === delegateAddress.toLowerCase()) {
+    if (
+      currentDelegate.toLowerCase() ===
+      RELAY_ERC20_ROUTER_ADDRESS.toLowerCase()
+    ) {
       console.log("  Status: ✓ Already delegated to Relay erc20Router");
       console.log(`  Delegate: ${currentDelegate}\n`);
-      return { isDelegated: true, delegateAddress };
+      return {
+        isDelegated: true,
+        delegateAddress: RELAY_ERC20_ROUTER_ADDRESS,
+      };
     } else {
       // Delegated to a different contract — need to re-authorize
       console.log(`  Status: Delegated to a DIFFERENT contract`);
       console.log(`  Current:  ${currentDelegate}`);
-      console.log(`  Expected: ${delegateAddress}`);
+      console.log(`  Expected: ${RELAY_ERC20_ROUTER_ADDRESS}`);
       console.log("  → User will need to sign a new 7702 authorization.\n");
-      return { isDelegated: false, delegateAddress };
+      return {
+        isDelegated: false,
+        delegateAddress: RELAY_ERC20_ROUTER_ADDRESS,
+      };
     }
   }
 
@@ -304,6 +209,12 @@ async function getSubsidizedQuote(
       recipient: userAddress,
       subsidizeFees: true,
       maxSubsidizationAmount: "5000000", // $5 cap per tx
+      appFees: [
+        {
+          recipient: "0x03508bB71268BBA25ECaCC8F620e01866650532c",
+          fee: "10",
+        },
+      ],
     }),
   });
 
@@ -649,10 +560,8 @@ async function main() {
 
   try {
     // 0. Check if EOA is already 7702-delegated to Relay's erc20Router
-    const { isDelegated, delegateAddress } = await checkAndSetupDelegation(
-      userAddress,
-      ORIGIN_CHAIN_ID
-    );
+    const { isDelegated, delegateAddress } =
+      await checkAndSetupDelegation(userAddress);
 
     // 1. Get a subsidized quote (requestId + deposit tx details)
     const quote = await getSubsidizedQuote(userAddress);
