@@ -1,2 +1,4 @@
 .env
 node_modules
+.claude
+.DS_STORE
