@@ -42,6 +42,7 @@ import { relayFetch, pollStatus } from "./relay.js";
 const RELAY_API_KEY = process.env.RELAY_API_KEY!;
 const USER_PRIVATE_KEY = process.env.USER_PRIVATE_KEY! as Hex;
 const REFERRER = process.env.REFERRER! as string;
+const DRY_RUN = process.env.DRY_RUN === "true";
 
 if (!RELAY_API_KEY) throw new Error("RELAY_API_KEY is required");
 if (!USER_PRIVATE_KEY) throw new Error("USER_PRIVATE_KEY is required");
@@ -69,6 +70,8 @@ async function main() {
     transport: http(),
   });
 
+  if (DRY_RUN) console.log("[DRY RUN MODE]\n");
+
   console.log(`User: ${userAddress}`);
   console.log(`Swap: ${SWAP_AMOUNT} PENGU (Base) → USDC (Optimism)\n`);
 
@@ -85,7 +88,7 @@ async function main() {
 
   // ── 2. Get quote ─────────────────────────────────────────────────────
 
-  const quote = await relayFetch("/quote", {
+  const quoteBody = {
     user: userAddress,
     originChainId: ORIGIN_CHAIN_ID,
     destinationChainId: DESTINATION_CHAIN_ID,
@@ -97,13 +100,15 @@ async function main() {
     //Enable this to completely sponsor destination execution
     subsidizeFees: false,
     //Enable this to recoup the origin gas fee
-    appFees: [
-      {
-        recipient: "0x03508bB71268BBA25ECaCC8F620e01866650532c",
-        fee: "80",
-      },
-    ],
-  });
+    // appFees: [
+    //   {
+    //     recipient: "0x03508bB71268BBA25ECaCC8F620e01866650532c",
+    //     fee: "80",
+    //   },
+    // ],
+  };
+
+  const quote = await relayFetch("/quote", quoteBody);
 
   const outInfo = quote.details?.currencyOut;
   if (outInfo) {
@@ -224,10 +229,9 @@ async function main() {
   console.log("Signed EIP-712 batch");
   console.log(`Request ID: ${requestId ?? "(none)"}`);
 
-
   // ── 6. Submit via /execute ───────────────────────────────────────────
 
-  const executeResult = await relayFetch("/execute", {
+  const executeBody = {
     executionKind: "rawCalls",
     data: {
       chainId: ORIGIN_CHAIN_ID,
@@ -242,7 +246,17 @@ async function main() {
       subsidizeFees: false,
     },
     ...(requestId ? { requestId } : {}),
-  });
+  };
+
+  if (DRY_RUN) {
+    console.log("\n[DRY RUN] Skipping /execute call.");
+    console.log("Request body:");
+    console.log(JSON.stringify(executeBody, null, 2));
+    console.log("\nDone (dry run).");
+    return;
+  }
+
+  const executeResult = await relayFetch("/execute", executeBody);
 
   console.log(`Submitted: ${executeResult.requestId}`);
 
