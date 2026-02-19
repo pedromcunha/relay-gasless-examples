@@ -52,7 +52,7 @@ const ORIGIN_CHAIN_ID = base.id;
 const DESTINATION_CHAIN_ID = optimism.id;
 const INPUT_TOKEN = "0x01e6bd233f7021e4f5698a3ae44242b76a246c0a" as Address;
 const OUTPUT_TOKEN = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85" as Address;
-const SWAP_AMOUNT = "100000";
+const SWAP_AMOUNT = "3000";
 const INPUT_DECIMALS = 18;
 
 // ---------------------------------------------------------------------------

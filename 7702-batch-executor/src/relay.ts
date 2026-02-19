@@ -10,9 +10,7 @@ export async function relayFetch(path: string, body: object) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(path === "/execute"
-        ? { "x-api-key": RELAY_API_KEY }
-        : { Authorization: `Bearer ${RELAY_API_KEY}` }),
+      "x-api-key": RELAY_API_KEY,
     },
     body: JSON.stringify(body),
   });
@@ -27,7 +25,12 @@ export async function pollStatus(requestId: string) {
   console.log(`\nPolling request ${requestId}...`);
   for (let i = 0; i < 60; i++) {
     const res = await fetch(
-      `${RELAY_API}/intents/status/v3?requestId=${requestId}`
+      `${RELAY_API}/intents/status/v3?requestId=${requestId}`,
+      {
+        headers: {
+          "x-api-key": RELAY_API_KEY,
+        },
+      }
     );
     const status = await res.json();
     console.log(`  [${i + 1}] ${status.status}`);
