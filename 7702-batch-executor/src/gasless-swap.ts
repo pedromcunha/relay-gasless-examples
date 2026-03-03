@@ -47,13 +47,14 @@ const DRY_RUN = process.env.DRY_RUN === "true";
 if (!RELAY_API_KEY) throw new Error("RELAY_API_KEY is required");
 if (!USER_PRIVATE_KEY) throw new Error("USER_PRIVATE_KEY is required");
 
-// Cross-chain swap: Based Pengu on Base → USDC on Optimism
+// Cross-chain swap: USDC on Base → USDC (PERPS) Hyperliquid
 const ORIGIN_CHAIN_ID = base.id;
-const DESTINATION_CHAIN_ID = optimism.id;
-const INPUT_TOKEN = "0x01e6bd233f7021e4f5698a3ae44242b76a246c0a" as Address;
-const OUTPUT_TOKEN = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85" as Address;
-const SWAP_AMOUNT = "3000";
-const INPUT_DECIMALS = 18;
+// const DESTINATION_CHAIN_ID = optimism.id;
+const DESTINATION_CHAIN_ID = 1337;
+const INPUT_TOKEN = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" as Address;
+const OUTPUT_TOKEN = "0x00000000000000000000000000000000" as Address;
+const SWAP_AMOUNT = "5";
+const INPUT_DECIMALS = 6;
 
 // ---------------------------------------------------------------------------
 // Main
@@ -73,7 +74,7 @@ async function main() {
   if (DRY_RUN) console.log("[DRY RUN MODE]\n");
 
   console.log(`User: ${userAddress}`);
-  console.log(`Swap: ${SWAP_AMOUNT} PENGU (Base) → USDC (Optimism)\n`);
+  console.log(`Swap: ${SWAP_AMOUNT} USDC (Base) → USDC (PERPS) Hyperliquid\n`);
 
   // ── 1. Check delegation ──────────────────────────────────────────────
 
@@ -83,7 +84,7 @@ async function main() {
     code.slice(8).toLowerCase() === CALIBUR_ADDRESS.slice(2).toLowerCase();
 
   console.log(
-    `Delegation: ${isDelegated ? "already delegated" : "needs delegation"}`
+    `Delegation: ${isDelegated ? "already delegated" : "needs delegation"}`,
   );
 
   // ── 2. Get quote ─────────────────────────────────────────────────────
@@ -117,7 +118,7 @@ async function main() {
   const outInfo = quote.details?.currencyOut;
   if (outInfo) {
     console.log(
-      `Quote: receive ${outInfo.amountFormatted} ${outInfo.currency?.symbol} on chain ${outInfo.currency?.chainId}`
+      `Quote: receive ${outInfo.amountFormatted} ${outInfo.currency?.symbol} on chain ${outInfo.currency?.chainId}`,
     );
   }
 
@@ -143,7 +144,7 @@ async function main() {
   console.log(`Batch: ${calls.length} calls`);
   for (let i = 0; i < calls.length; i++) {
     console.log(
-      `  Call ${i + 1}: to=${calls[i].to} value=${calls[i].value} data=${calls[i].data.slice(0, 10)}...`
+      `  Call ${i + 1}: to=${calls[i].to} value=${calls[i].value} data=${calls[i].data.slice(0, 10)}...`,
     );
   }
 
@@ -190,7 +191,7 @@ async function main() {
     console.log(`Calibur nonce: ${caliburNonce}`);
   } catch (e) {
     console.log(
-      `Calibur nonce: 0 (getSeq failed: ${(e as Error).message?.slice(0, 80)})`
+      `Calibur nonce: 0 (getSeq failed: ${(e as Error).message?.slice(0, 80)})`,
     );
   }
 
@@ -221,7 +222,7 @@ async function main() {
   // wrappedSignature = abi.encode(signature, hookData) — empty hookData for root key
   const wrappedSignature = encodeAbiParameters(
     [{ type: "bytes" }, { type: "bytes" }],
-    [signature, "0x"]
+    [signature, "0x"],
   );
 
   const batchCallData = encodeFunctionData({
