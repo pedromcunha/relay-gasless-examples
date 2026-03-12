@@ -6,11 +6,13 @@
  * full fee sponsorship. Works with any ERC-20 — no permit required.
  *
  * Flow:
- *   1. Get a swap quote from Relay
- *   2. Sign EIP-7702 authorization (delegate EOA → Calibur) if needed
- *   3. Sign the batch via EIP-712 (Calibur's signed execution path)
- *   4. Submit via Relay /execute
- *   5. Poll for completion
+ *   1. Check EOA delegation status
+ *   2. Estimate origin gas cost (RPC gas price + Relay token price API)
+ *   3. Get a swap quote from Relay (with app fee bps to recoup gas)
+ *   4. Sign EIP-7702 authorization (delegate EOA → Calibur) if needed
+ *   5. Sign the batch via EIP-712 (Calibur's signed execution path)
+ *   6. Submit via Relay /execute (with fee sponsorship)
+ *   7. Poll for completion
  */
 
 import "dotenv/config";
@@ -19,6 +21,7 @@ import {
   createPublicClient,
   http,
   parseUnits,
+  formatEther,
   encodeFunctionData,
   encodeAbiParameters,
   type Hex,
@@ -47,13 +50,13 @@ const DRY_RUN = process.env.DRY_RUN === "true";
 if (!RELAY_API_KEY) throw new Error("RELAY_API_KEY is required");
 if (!USER_PRIVATE_KEY) throw new Error("USER_PRIVATE_KEY is required");
 
-// Cross-chain swap: Based Pengu on Base → USDC on Optimism
+// Same-chain swap: USDC → ETH on Base
 const ORIGIN_CHAIN_ID = base.id;
-const DESTINATION_CHAIN_ID = optimism.id;
-const INPUT_TOKEN = "0x01e6bd233f7021e4f5698a3ae44242b76a246c0a" as Address;
-const OUTPUT_TOKEN = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85" as Address;
-const SWAP_AMOUNT = "3000";
-const INPUT_DECIMALS = 18;
+const DESTINATION_CHAIN_ID = base.id;
+const INPUT_TOKEN = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" as Address;
+const OUTPUT_TOKEN = "0x0000000000000000000000000000000000000000" as Address;
+const SWAP_AMOUNT = "0.5";
+const INPUT_DECIMALS = 6;
 
 // ---------------------------------------------------------------------------
 // Main
@@ -73,7 +76,7 @@ async function main() {
   if (DRY_RUN) console.log("[DRY RUN MODE]\n");
 
   console.log(`User: ${userAddress}`);
-  console.log(`Swap: ${SWAP_AMOUNT} PENGU (Base) → USDC (Optimism)\n`);
+  console.log(`Swap: ${SWAP_AMOUNT} USDC (Base) → ETH (Base)\n`);
 
   // ── 1. Check delegation ──────────────────────────────────────────────
 
@@ -83,45 +86,87 @@ async function main() {
     code.slice(8).toLowerCase() === CALIBUR_ADDRESS.slice(2).toLowerCase();
 
   console.log(
-    `Delegation: ${isDelegated ? "already delegated" : "needs delegation"}`
+    `Delegation: ${isDelegated ? "already delegated" : "needs delegation"}`,
   );
 
-  // ── 2. Get quote ─────────────────────────────────────────────────────
+  // ── 2. Estimate origin gas to calculate app fee bps ─────────────────
 
-  const quoteBody = {
+  const RELAY_API = process.env.RELAY_API_URL || "https://api.relay.link";
+  const ESTIMATED_GAS = 250_000n;
+  const NATIVE_TOKEN = "0x0000000000000000000000000000000000000000";
+
+  // Fetch gas price from RPC + native token USD price from Relay in parallel
+  const [gasPrice, ethPriceRes] = await Promise.all([
+    publicClient.getGasPrice(),
+    fetch(
+      `${RELAY_API}/currencies/token/price?address=${NATIVE_TOKEN}&chainId=${ORIGIN_CHAIN_ID}`,
+    ).then((r) => r.json()),
+  ]);
+
+  const gasCostWei = gasPrice * ESTIMATED_GAS;
+  const ethPriceUsd: number = ethPriceRes.price;
+  const gasCostUsd = parseFloat(formatEther(gasCostWei)) * ethPriceUsd;
+  const inputUsd = parseFloat(SWAP_AMOUNT); // USDC ≈ $1
+
+  // fee bps = (gasCost / inputAmount) * 10000, rounded up so we don't under-collect.
+  // Same-chain app fees require a $0.025 minimum (Relay-enforced). On cheap L2s
+  // the gas cost is well below this, so the floor dominates. Cross-chain swaps
+  // have no minimum — the gas-based calculation would be used as-is.
+  const MIN_SAME_CHAIN_FEE_USD = 0.025;
+  const isSameChain = ORIGIN_CHAIN_ID === DESTINATION_CHAIN_ID;
+  const gasBps =
+    inputUsd > 0 ? Math.ceil((gasCostUsd / inputUsd) * 10_000) : 0;
+  const minBps =
+    isSameChain && inputUsd > 0
+      ? Math.ceil((MIN_SAME_CHAIN_FEE_USD / inputUsd) * 10_000)
+      : 0;
+  const feeBps = Math.max(gasBps, minBps);
+  const feeUsd = (feeBps / 10_000) * inputUsd;
+
+  console.log(
+    `Gas estimate: ${formatEther(gasCostWei)} ETH ($${gasCostUsd.toFixed(4)}) | ETH price: $${ethPriceUsd.toFixed(0)}`,
+  );
+  console.log(
+    `App fee: ${feeBps} bps ($${feeUsd.toFixed(4)})${minBps > gasBps ? ` [floored from ${gasBps} bps — same-chain $0.025 min]` : ""}`,
+  );
+
+  // ── 3. Get quote ──────────────────────────────────────────────────────
+
+  const inputAmount = parseUnits(SWAP_AMOUNT, INPUT_DECIMALS).toString();
+
+  const quote = await relayFetch("/quote", {
     user: userAddress,
     originChainId: ORIGIN_CHAIN_ID,
     destinationChainId: DESTINATION_CHAIN_ID,
     originCurrency: INPUT_TOKEN,
     destinationCurrency: OUTPUT_TOKEN,
-    amount: parseUnits(SWAP_AMOUNT, INPUT_DECIMALS).toString(),
+    amount: inputAmount,
     tradeType: "EXACT_INPUT",
     recipient: userAddress,
-    // Extra gas for Calibur's execute() wrapper (EIP-712 verification + batch
-    // dispatch + optional 7702 authorization). Relay's built-in gas buffers
-    // cover most of the origin cost; this just accounts for the contract overhead.
-    originGasOverhead: "80000",
-    //Enable this to completely sponsor destination execution
-    subsidizeFees: false,
-    //Enable this to recoup the origin gas fee
-    // appFees: [
-    //   {
-    //     recipient: "0x03508bB71268BBA25ECaCC8F620e01866650532c",
-    //     fee: "80",
-    //   },
-    // ],
-  };
-
-  const quote = await relayFetch("/quote", quoteBody);
+    // Extra gas beyond Relay's base estimate. Ideally ~80k for Calibur's
+    // execute() wrapper (~40k with 2x buffer), but the solver currently
+    // under-estimates gas for multi-hop swap routes (see solver bug below).
+    // 500k is a temporary workaround until the solver fixes gas estimation.
+    originGasOverhead: "500000",
+    appFees:
+      feeBps > 0
+        ? [
+            {
+              recipient: "0x03508bB71268BBA25ECaCC8F620e01866650532c",
+              fee: String(feeBps),
+            },
+          ]
+        : [],
+  });
 
   const outInfo = quote.details?.currencyOut;
   if (outInfo) {
     console.log(
-      `Quote: receive ${outInfo.amountFormatted} ${outInfo.currency?.symbol} on chain ${outInfo.currency?.chainId}`
+      `Quote: receive ${outInfo.amountFormatted} ${outInfo.currency?.symbol} on chain ${outInfo.currency?.chainId}`,
     );
   }
 
-  // ── 3. Extract calls from quote steps ────────────────────────────────
+  // ── 4. Extract calls from quote steps ────────────────────────────────
 
   // The quote returns approve + deposit as separate tx items.
   // We batch them into a single atomic Calibur execute call.
@@ -143,11 +188,11 @@ async function main() {
   console.log(`Batch: ${calls.length} calls`);
   for (let i = 0; i < calls.length; i++) {
     console.log(
-      `  Call ${i + 1}: to=${calls[i].to} value=${calls[i].value} data=${calls[i].data.slice(0, 10)}...`
+      `  Call ${i + 1}: to=${calls[i].to} value=${calls[i].value} data=${calls[i].data.slice(0, 10)}...`,
     );
   }
 
-  // ── 4. Sign EIP-7702 authorization (if needed) ──────────────────────
+  // ── 5. Sign EIP-7702 authorization (if needed) ──────────────────────
 
   let authorization = null;
   if (!isDelegated) {
@@ -170,7 +215,7 @@ async function main() {
     console.log("Signed 7702 authorization");
   }
 
-  // ── 5. Sign batch via EIP-712 (Calibur signed execution) ────────────
+  // ── 6. Sign batch via EIP-712 (Calibur signed execution) ────────────
 
   // Why signed execution: the direct execute(BatchedCall) checks msg.sender
   // is the owner. Since Relay's relayer submits the tx, msg.sender would be
@@ -190,7 +235,7 @@ async function main() {
     console.log(`Calibur nonce: ${caliburNonce}`);
   } catch (e) {
     console.log(
-      `Calibur nonce: 0 (getSeq failed: ${(e as Error).message?.slice(0, 80)})`
+      `Calibur nonce: 0 (getSeq failed: ${(e as Error).message?.slice(0, 80)})`,
     );
   }
 
@@ -221,7 +266,7 @@ async function main() {
   // wrappedSignature = abi.encode(signature, hookData) — empty hookData for root key
   const wrappedSignature = encodeAbiParameters(
     [{ type: "bytes" }, { type: "bytes" }],
-    [signature, "0x"]
+    [signature, "0x"],
   );
 
   const batchCallData = encodeFunctionData({
@@ -233,7 +278,7 @@ async function main() {
   console.log("Signed EIP-712 batch");
   console.log(`Request ID: ${requestId ?? "(none)"}`);
 
-  // ── 6. Submit via /execute ───────────────────────────────────────────
+  // ── 7. Submit via /execute ───────────────────────────────────────────
 
   const executeBody = {
     executionKind: "rawCalls",
@@ -246,8 +291,8 @@ async function main() {
     },
     executionOptions: {
       referrer: REFERRER,
-      //Enable this to completely cover origin fees
-      subsidizeFees: false,
+      // Sponsor covers origin gas — recouped via the app fee bps above
+      subsidizeFees: true,
     },
     ...(requestId ? { requestId } : {}),
   };
@@ -264,7 +309,7 @@ async function main() {
 
   console.log(`Submitted: ${executeResult.requestId}`);
 
-  // ── 7. Poll ──────────────────────────────────────────────────────────
+  // ── 8. Poll ──────────────────────────────────────────────────────────
 
   await pollStatus(executeResult.requestId);
   console.log("\nDone.");
